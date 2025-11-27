@@ -7,20 +7,22 @@ import BotConfig from "@/models/BotConfig";
 import BotSettings from "@/models/BotSettings";
 import { generateWithYuki } from "@/lib/gemini";
 
-// Telegram raw body handler
+// Telegram raw body
 export const config = {
   api: { bodyParser: false },
 };
 
+// Read raw body
 function parseRawBody(req) {
   return new Promise((resolve, reject) => {
     let data = "";
-    req.on("data", (c) => (data += c));
+    req.on("data", (chunk) => (data += chunk));
     req.on("end", () => resolve(data));
     req.on("error", reject);
   });
 }
 
+// Telegram send message
 async function sendMessage(token, chatId, text, extra = {}) {
   await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST",
@@ -39,11 +41,11 @@ export default async function handler(req, res) {
 
   await dbConnect();
   const raw = await parseRawBody(req);
-  let update;
 
+  let update;
   try {
-    update = JSON.parse(raw);
-  } catch {
+    update = JSON.parse(raw.toString("utf8"));
+  } catch (_) {
     return res.status(200).json({ ok: true });
   }
 
@@ -51,18 +53,18 @@ export default async function handler(req, res) {
   if (!msg) return res.status(200).json({ ok: true });
 
   const chatId = msg.chat.id;
-  const chatType = msg.chat.type;
   const userId = msg.from.id.toString();
   const userText = msg.text || msg.caption || "";
-  const lower = userText.toLowerCase();
+  const chatType = msg.chat.type;
   const isGroup = chatType.includes("group");
 
-  // Load bot config
-  const cfg = await BotConfig.findOne().lean();
-  if (!cfg?.telegramBotToken) return res.status(200).json({ ok: true });
-  const BOT_TOKEN = cfg.telegramBotToken;
+  const lower = userText.toLowerCase();
 
-  // Settings
+  // CONFIG
+  const botCfg = await BotConfig.findOne().lean();
+  if (!botCfg?.telegramBotToken) return res.status(200).json({ ok: true });
+  const BOT_TOKEN = botCfg.telegramBotToken;
+
   const settings = (await BotSettings.findOne().lean()) || {};
   const botName = settings.botName || "Yuki";
   const ownerName = settings.ownerName || "Owner";
@@ -73,13 +75,31 @@ export default async function handler(req, res) {
   const personality = settings.personality || "normal";
   const groupLink = settings.groupLink || "";
 
-  // Name cleaning
+  // CLEAN NAME MATCHING (Unicode/punctuation remove)
   const cleanText = lower.replace(/[^\p{L}\p{N}\s]/gu, "").trim();
   const cleanBotName = botName.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "").trim();
 
-  // -------------------------
-  // /start command (DM + group)
-  // -------------------------
+  // --------------------------
+  // GROUP LOGGER
+  // --------------------------
+  if (isGroup) {
+    await Group.findOneAndUpdate(
+      { chatId },
+      {
+        chatId,
+        title: msg.chat.title || "",
+        username: msg.chat.username || "",
+        type: chatType,
+        lastActiveAt: new Date(),
+        $setOnInsert: { firstSeenAt: new Date() },
+      },
+      { upsert: true }
+    );
+  }
+
+  // --------------------------
+  // /start COMMAND
+  // --------------------------
   if (lower.startsWith("/start")) {
     let intro = `Hey, main *${botName}* hu ✨`;
     if (groupLink) intro += `\nGroup: ${groupLink}`;
@@ -93,85 +113,41 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true });
   }
 
-  // =================================================
-  // 🔥 PRIVATE CHAT FIX — ALWAYS REPLY
-  // =================================================
-  if (chatType === "private") {
+  // =====================================================
+  // STRICT GROUP MODE — ONLY reply in 3 cases:
+  // 1) reply-to-bot
+  // 2) @username
+  // 3) botName mention (unicode safe)
+  // =====================================================
+  let shouldReply = false;
 
-    // Memory
-    let memory = await Memory.findOne({ chatId, userId });
-    if (!memory) {
-      memory = await Memory.create({
-        chatId,
-        userId,
-        mode: personality,
-        history: [],
-      });
-    }
+  // 1) PRIVATE → always reply
+  if (!isGroup) shouldReply = true;
 
-    memory.history.push({ role: "user", text: userText });
-    if (memory.history.length > 10)
-      memory.history = memory.history.slice(-10);
-    await memory.save();
+  // 2) User replied directly to bot
+  if (
+    msg.reply_to_message?.from?.username?.toLowerCase() === botUsername
+  ) shouldReply = true;
 
-    const historyText = memory.history
-      .map((m) => `${m.role === "user" ? "User" : "Her"}: ${m.text}`)
-      .join("\n");
+  // 3) @mention
+  if (lower.includes("@" + botUsername)) shouldReply = true;
 
-    const prompt = `
-Tumhara naam *${botName}* hai.
-Tum ek friendly, sweet, natural tone me baat karne wali ho.
+  // 4) Loose name match
+  if (
+    cleanText.includes(cleanBotName) ||
+    lower.includes(botName.toLowerCase())
+  ) {
+    shouldReply = true;
+  }
 
-Owner = ${ownerName}
-
-Conversation:
-${historyText}
-
-User: ${userText}
-Her:
-`;
-
-    let reply;
-    try {
-      reply = await generateWithYuki(prompt);
-    } catch {
-      reply = "Oops, thoda issue aa gaya 😅";
-    }
-
-    memory.history.push({ role: "assistant", text: reply });
-    if (memory.history.length > 10)
-      memory.history = memory.history.slice(-10);
-    await memory.save();
-
-    await sendMessage(BOT_TOKEN, chatId, reply, {
-      reply_to_message_id: msg.message_id,
-    });
-
+  // 5) Otherwise ignore group messages
+  if (isGroup && !shouldReply) {
     return res.status(200).json({ ok: true });
   }
 
-  // =================================================
-  // 🔥 GROUP STRICT MODE
-  // =================================================
-  let shouldReply = false;
-
-  // 1) Reply-to-bot
-  if (msg.reply_to_message?.from?.username?.toLowerCase() === botUsername)
-    shouldReply = true;
-
-  // 2) @mention
-  if (lower.includes("@" + botUsername))
-    shouldReply = true;
-
-  // 3) Bot name mention
-  if (cleanText.includes(cleanBotName)) shouldReply = true;
-
-  // 4) Ignore everything else
-  if (!shouldReply) return res.status(200).json({ ok: true });
-
-  // -------------------------
-  // Memory for group
-  // -------------------------
+  // --------------------------
+  // MEMORY SYSTEM
+  // --------------------------
   let memory = await Memory.findOne({ chatId, userId });
   if (!memory) {
     memory = await Memory.create({
@@ -182,18 +158,49 @@ Her:
     });
   }
 
-  memory.history.push({ role: "user", text: userText });
+  memory.history.push({
+    role: "user",
+    text: userText,
+    time: new Date(),
+  });
+
   if (memory.history.length > 10)
     memory.history = memory.history.slice(-10);
+
+  memory.mode = personality;
   await memory.save();
 
   const historyText = memory.history
     .map((m) => `${m.role === "user" ? "User" : "Her"}: ${m.text}`)
     .join("\n");
 
-  const prompt = `
+  // --------------------------
+  // PROMPT SYSTEM
+  // --------------------------
+  const genderLine =
+    gender === "male"
+      ? "Tum 18 saal ke Delhi ke ladke ho, friendly + chill tone me."
+      : "Tum 18 saal ki Delhi ki cute girl ho, soft + friendly tone me.";
+
+  const toneMap = {
+    flirty:
+      "Tum flirty, teasing, sweet tone me natural reply doge. 1–3 lines me.",
+    professional:
+      "Tum calm, polite, respectful tone me reply doge. No flirting.",
+    normal:
+      "Tum soft Hinglish me friendly, sweet, natural tone me reply doge. 1–3 lines.",
+  };
+
+  const ownerRule = `
+Tumhara REAL owner sirf *${ownerName}* hai.
+Owner ka naam sirf tab lena jab koi specifically pooche.
+`;
+
+  const finalPrompt = `
 Tumhara naam *${botName}* hai.
-Tum group me sirf jab bulaaye jao tab reply karti ho.
+${genderLine}
+${toneMap[personality]}
+${ownerRule}
 
 Conversation:
 ${historyText}
@@ -202,18 +209,38 @@ User: ${userText}
 Her:
 `;
 
+  // Typing animation
+  await fetch(
+    `https://api.telegram.org/bot${BOT_TOKEN}/sendChatAction`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, action: "typing" }),
+    }
+  );
+
+  await new Promise((r) => setTimeout(r, 900));
+
+  // Generate reply
   let reply;
   try {
-    reply = await generateWithYuki(prompt);
+    reply = await generateWithYuki(finalPrompt);
   } catch {
     reply = "Oops, thoda issue aa gaya 😅";
   }
 
-  memory.history.push({ role: "assistant", text: reply });
+  // Save bot message
+  memory.history.push({
+    role: "assistant",
+    text: reply,
+    time: new Date(),
+  });
   if (memory.history.length > 10)
     memory.history = memory.history.slice(-10);
+
   await memory.save();
 
+  // SEND FINAL MESSAGE
   await sendMessage(BOT_TOKEN, chatId, reply, {
     reply_to_message_id: msg.message_id,
   });
