@@ -1,0 +1,113 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* -----------------------------
+   Global Styling
+----------------------------- */
+
+html,
+body {
+  padding: 0;
+  margin: 0;
+  background-color: #0b0f19; /* Smooth dark */
+  color: white;
+  font-family: 'Inter', sans-serif;
+  scroll-behavior: smooth;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Remove blue tap highlight on mobile */
+* {
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Prevent text selection when dragging UI */
+.noselect {
+  user-select: none;
+}
+
+/* -----------------------------------
+   Custom Scrollbar (Dark + Smooth)
+----------------------------------- */
+
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+/* -----------------------------------
+   Smooth Card Hover + Tap effect
+----------------------------------- */
+
+.card-hover {
+  transition: all 0.25s ease-in-out;
+}
+
+.card-hover:hover {
+  transform: translateY(-2px);
+}
+
+/* -----------------------------------
+   Gradient text classes
+----------------------------------- */
+
+.text-gradient {
+  background: linear-gradient(to right, #38bdf8, #f472b6);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+/* -----------------------------------
+   Inputs + Buttons Smooth Look
+----------------------------------- */
+
+input,
+textarea,
+select {
+  @apply bg-slate-900 border border-slate-700 rounded-2xl px-3 py-2 text-sm text-white outline-none transition-all;
+}
+
+input:focus,
+textarea:focus,
+select:focus {
+  @apply border-sky-500;
+}
+
+button {
+  @apply rounded-2xl px-4 py-2 text-sm font-medium transition-all;
+}
+
+button:active {
+  transform: scale(0.96);
+}
+
+/* Fix for mobile Safari inputs */
+input,
+select,
+textarea {
+  -webkit-appearance: none;
+}
+
+/* -----------------------------------
+   Utility: Divider Line
+----------------------------------- */
+
+.divider {
+  height: 1px;
+  background: rgba(255, 255, 255, 0.1);
+  margin: 12px 0;
+}
