@@ -7,12 +7,11 @@ import BotConfig from "@/models/BotConfig";
 import BotSettings from "@/models/BotSettings";
 import { generateWithYuki } from "@/lib/gemini";
 
-// Telegram raw body support
+// Raw body reader for Telegram
 export const config = {
   api: { bodyParser: false },
 };
 
-// Read raw body
 function parseRawBody(req) {
   return new Promise((resolve, reject) => {
     let data = "";
@@ -22,7 +21,7 @@ function parseRawBody(req) {
   });
 }
 
-// Telegram send message
+// Telegram send message with reply support
 async function sendMessage(token, chatId, text, extra = {}) {
   await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST",
@@ -45,7 +44,7 @@ export default async function handler(req, res) {
   let update;
   try {
     update = JSON.parse(raw.toString("utf8"));
-  } catch (err) {
+  } catch (_) {
     return res.status(200).json({ ok: true });
   }
 
@@ -66,22 +65,23 @@ export default async function handler(req, res) {
   if (!botCfg?.telegramBotToken) return res.status(200).json({ ok: true });
   const BOT_TOKEN = botCfg.telegramBotToken;
 
-  // Panel settings
+  // Load panel settings
   const settings = (await BotSettings.findOne().lean()) || {};
 
   const ownerName = settings.ownerName || "Owner";
   const botName = settings.botName || "Yuki";
-  const botUsername =
-    (settings.botUsername || "yuki_ai_bot").replace("@", "");
+  const botUsername = (settings.botUsername || "yuki_ai_bot")
+    .replace("@", "")
+    .toLowerCase();
   const gender = settings.gender || "female";
   const personality = settings.personality || "normal";
   const groupLink = settings.groupLink || "";
 
   const lower = userText.toLowerCase().trim();
 
-  // -----------------------
+  // ------------------------
   // GROUP LOGGER
-  // -----------------------
+  // ------------------------
   if (isGroup) {
     await Group.findOneAndUpdate(
       { chatId: String(chatId) },
@@ -97,9 +97,9 @@ export default async function handler(req, res) {
     );
   }
 
-  // -----------------------
-  // /start COMMAND
-  // -----------------------
+  // ------------------------
+  // /start command
+  // ------------------------
   if (lower.startsWith("/start")) {
     let intro = `Hey, main *${botName}* hu ✨`;
 
@@ -107,50 +107,53 @@ export default async function handler(req, res) {
     intro += `\nOwner: *${ownerName}*`;
     intro += `\nBot: *@${botUsername}*`;
 
-    await sendMessage(BOT_TOKEN, chatId, intro);
+    await sendMessage(BOT_TOKEN, chatId, intro, {
+      reply_to_message_id: msg.message_id,
+    });
+
     return res.status(200).json({ ok: true });
   }
 
-  // -----------------------
-  // SMART GROUP REPLY
-  // -----------------------
+  // ------------------------
+  // SMART GROUP REPLY LOGIC
+  // ------------------------
   let shouldReply = false;
 
   // 1) PRIVATE → always reply
   if (!isGroup) shouldReply = true;
 
-  // 2) User replied to bot
+  // Load existing memory
+  let memory = await Memory.findOne({ chatId, userId });
+
+  // 2) If user replies to bot
   if (
-    msg.reply_to_message?.from?.username?.toLowerCase() ===
-    botUsername.toLowerCase()
+    msg.reply_to_message?.from?.username?.toLowerCase() === botUsername
   ) {
     shouldReply = true;
   }
 
-  // 3) Conversation flow: last message by bot
-  const existingMemory = await Memory.findOne({ chatId, userId });
-  if (existingMemory && existingMemory.history.length > 0) {
-    const last = existingMemory.history[existingMemory.history.length - 1];
+  // 3) Natural conversation: last message from bot
+  if (memory && memory.history.length > 0) {
+    const last = memory.history[memory.history.length - 1];
     if (last.role === "assistant") shouldReply = true;
   }
 
-  // 4) Mention or name usage
+  // 4) Mention / name
   if (
     lower.includes(botName.toLowerCase()) ||
-    lower.includes("@" + botUsername.toLowerCase())
+    lower.includes("@" + botUsername)
   ) {
     shouldReply = true;
   }
 
-  // 5) Anti spam
+  // 5) Anti-spam
   if (isGroup && !shouldReply) {
     return res.status(200).json({ ok: true });
   }
 
-  // -----------------------
-  // MEMORY HANDLING
-  // -----------------------
-  let memory = await Memory.findOne({ chatId, userId });
+  // ------------------------
+  // MEMORY SYSTEM
+  // ------------------------
   if (!memory) {
     memory = await Memory.create({
       chatId,
@@ -160,16 +163,14 @@ export default async function handler(req, res) {
     });
   }
 
-  // Save user message
   memory.history.push({
     role: "user",
     text: userText,
     time: new Date(),
   });
 
-  if (memory.history.length > 10) {
+  if (memory.history.length > 10)
     memory.history = memory.history.slice(-10);
-  }
 
   memory.mode = personality;
   await memory.save();
@@ -178,33 +179,32 @@ export default async function handler(req, res) {
     .map((m) => `${m.role === "user" ? "User" : "Her"}: ${m.text}`)
     .join("\n");
 
-  // -----------------------
-  // PROMPT SYSTEM
-  // -----------------------
-
+  // ------------------------
+  // BUILD PROMPT
+  // ------------------------
   const genderLine =
     gender === "male"
-      ? "Tum 18 saal ke Delhi ke ladke ho, chill + friendly persona ke sath."
-      : "Tum 18 saal ki Delhi ki cute girl ho, soft + friendly persona ke sath.";
+      ? "Tum 18 saal ke Delhi ke ladke ho, chill + friendly tone me."
+      : "Tum 18 saal ki Delhi ki cute girl ho, soft + friendly tone me.";
 
-  let toneLine = {
+  const toneMap = {
     flirty:
-      "Tum flirty tone me playful, teasing answers doge. Emojis allowed. Over bold nahi hona.",
+      "Tum flirty, playful, teasing tone me 1–3 lines me natural reply doge.",
     professional:
-      "Tum calm, polite, professional tone me reply doge. No flirting.",
+      "Tum calm, polite, professional Hinglish tone me reply doge.",
     normal:
-      "Tum soft Hinglish me, friendly natural tone me 1–3 lines me reply doge.",
-  }[personality];
+      "Tum soft Hinglish me friendly natural tone me reply doge.",
+  };
 
   const ownerRule = `
-Tumhara REAL owner sirf *${ownerName}* hai.
-Owner ka naam sirf tab lo jab koi specifically pooche.
+Tumhara real owner sirf *${ownerName}* hai.
+Owner ka naam sirf tab lena jab koi specifically pooche.
 `;
 
   const finalPrompt = `
 Tumhara naam *${botName}* hai.
 ${genderLine}
-${toneLine}
+${toneMap[personality]}
 ${ownerRule}
 
 Conversation:
@@ -214,9 +214,7 @@ User: ${userText}
 Her:
 `;
 
-  // -----------------------
-  // TYPING EFFECT
-  // -----------------------
+  // Typing animation
   await fetch(
     `https://api.telegram.org/bot${BOT_TOKEN}/sendChatAction`,
     {
@@ -228,17 +226,15 @@ Her:
 
   await new Promise((r) => setTimeout(r, 900));
 
-  // -----------------------
-  // AI REPLY
-  // -----------------------
+  // Generate response
   let reply;
   try {
     reply = await generateWithYuki(finalPrompt);
-  } catch (err) {
+  } catch {
     reply = "Oops, thoda issue aa gaya 😅";
   }
 
-  // Save assistant msg
+  // Save bot response
   memory.history.push({
     role: "assistant",
     text: reply,
@@ -246,10 +242,13 @@ Her:
   });
   if (memory.history.length > 10)
     memory.history = memory.history.slice(-10);
+
   await memory.save();
 
-  // Send Telegram message
-  await sendMessage(BOT_TOKEN, chatId, reply);
+  // SEND FINAL MESSAGE (THREAD FIX)
+  await sendMessage(BOT_TOKEN, chatId, reply, {
+    reply_to_message_id: msg.message_id,
+  });
 
   return res.status(200).json({ ok: true });
 }
