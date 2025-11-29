@@ -1,3 +1,5 @@
+// pages/api/telegram-webhook.js
+
 import dbConnect from "@/lib/db";
 import Memory from "@/models/Memory";
 import Group from "@/models/Group";
@@ -30,12 +32,28 @@ function parseRawBody(req) {
   });
 }
 
-// Telegram API functions
+// Telegram API helpers
 async function sendMessage(token, chatId, text, extra = {}) {
   await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text, parse_mode: "Markdown", ...extra }),
+    body: JSON.stringify({
+      chat_id: chatId,
+      text,
+      parse_mode: "Markdown",
+      ...extra,
+    }),
+  });
+}
+
+async function deleteMessage(token, chatId, messageId) {
+  await fetch(`https://api.telegram.org/bot${token}/deleteMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      message_id: messageId,
+    }),
   });
 }
 
@@ -48,6 +66,7 @@ async function kickUser(token, chatId, userId) {
 }
 
 async function banUser(token, chatId, userId) {
+  // For now ban == kick (can extend with until_date if needed)
   await kickUser(token, chatId, userId);
 }
 
@@ -61,6 +80,21 @@ async function muteUser(token, chatId, userId) {
       permissions: { can_send_messages: false },
     }),
   });
+}
+
+// Only admins / owner can use moderation commands (Option C)
+async function isAdminOrOwner(token, chatId, userId) {
+  try {
+    const res = await fetch(
+      `https://api.telegram.org/bot${token}/getChatMember?chat_id=${chatId}&user_id=${userId}`
+    );
+    const data = await res.json();
+    if (!data.ok) return false;
+    const status = data.result.status;
+    return status === "administrator" || status === "creator";
+  } catch {
+    return false;
+  }
 }
 
 export default async function handler(req, res) {
@@ -94,7 +128,9 @@ export default async function handler(req, res) {
   const settings = (await BotSettings.findOne().lean()) || {};
   const botName = settings.botName || "Yuki";
   const ownerName = settings.ownerName || "Owner";
-  const botUsername = (settings.botUsername || "yuki_ai_bot").replace("@", "").toLowerCase();
+  const botUsername = (settings.botUsername || "yuki_ai_bot")
+    .replace("@", "")
+    .toLowerCase();
   const gender = settings.gender || "female";
   const personality = settings.personality || "normal";
   const groupLink = settings.groupLink || "";
@@ -121,51 +157,78 @@ export default async function handler(req, res) {
 
   // /start
   if (lower.startsWith("/start")) {
-    let intro = `Hey, main *${botName}* hu âœ¨`;
+    let intro = `Hey, main *${botName}* hu ✨`;
     if (groupLink) intro += `\nGroup: ${groupLink}`;
     intro += `\nOwner: *${ownerName}*\nBot: *@${botUsername}*`;
 
-    await sendMessage(BOT_TOKEN, chatId, intro, { reply_to_message_id: msg.message_id });
+    await sendMessage(BOT_TOKEN, chatId, intro, {
+      reply_to_message_id: msg.message_id,
+    });
     return res.status(200).json({ ok: true });
   }
 
   // =====================================================
-  // MODERATION LAYER (Before commands)
+  // MODERATION LAYER (Before commands, only for non-commands)
   // =====================================================
 
-  // URL BLOCK
-  if (checkURL(userText)) {
-    await sendMessage(BOT_TOKEN, chatId, `âš ï¸ Suspicious link blocked.`);
-    return res.status(200).json({ ok: true });
-  }
+  if (!userText.startsWith("/")) {
+    const displayName = msg.from.username
+      ? `@${msg.from.username}`
+      : msg.from.first_name;
 
-  // SPAM BLOCK
-  if (checkSpam(userText)) {
-    await sendMessage(BOT_TOKEN, chatId, `âš ï¸ Spam removed.`);
-    return res.status(200).json({ ok: true });
-  }
+    // URL BLOCK
+    if (checkURL(userText)) {
+      await deleteMessage(BOT_TOKEN, chatId, msg.message_id);
+      await sendMessage(
+        BOT_TOKEN,
+        chatId,
+        `⚠️ Suspicious link blocked from ${displayName}`
+      );
+      return res.status(200).json({ ok: true });
+    }
 
-  // FLOOD PROTECT
-  const flood = checkFlood(userId);
-  if (flood === "warn") {
-    await sendMessage(BOT_TOKEN, chatId, `âš ï¸ Slow down ${msg.from.first_name}`);
-  }
-  if (flood === "mute") {
-    await muteUser(BOT_TOKEN, chatId, userId);
-    await sendMessage(BOT_TOKEN, chatId, `ðŸ”‡ Auto-muted (Flooding)`);
-    return res.status(200).json({ ok: true });
-  }
-  if (flood === "kick") {
-    await kickUser(BOT_TOKEN, chatId, userId);
-    await sendMessage(BOT_TOKEN, chatId, `ðŸš« Auto-kicked (Flooding)`);
-    return res.status(200).json({ ok: true });
-  }
+    // SPAM BLOCK
+    if (checkSpam(userText)) {
+      await deleteMessage(BOT_TOKEN, chatId, msg.message_id);
+      await sendMessage(
+        BOT_TOKEN,
+        chatId,
+        `⚠️ Spam removed from ${displayName}`
+      );
+      return res.status(200).json({ ok: true });
+    }
 
-  // AI MODERATION
-  const mod = await aiCheck(userText);
-  if (mod.category !== "safe" && mod.score > 0.70) {
-    await sendMessage(BOT_TOKEN, chatId, `âš ï¸ Warning: ${mod.category}`);
-    return res.status(200).json({ ok: true });
+    // FLOOD PROTECT
+    const flood = checkFlood(userId);
+    if (flood === "warn") {
+      await sendMessage(
+        BOT_TOKEN,
+        chatId,
+        `⚠️ Slow down ${msg.from.first_name}`
+      );
+    }
+    if (flood === "mute") {
+      await muteUser(BOT_TOKEN, chatId, userId);
+      await sendMessage(BOT_TOKEN, chatId, `🔇 Auto-muted (Flooding)`);
+      return res.status(200).json({ ok: true });
+    }
+    if (flood === "kick") {
+      await kickUser(BOT_TOKEN, chatId, userId);
+      await sendMessage(BOT_TOKEN, chatId, `🚫 Auto-kicked (Flooding)`);
+      return res.status(200).json({ ok: true });
+    }
+
+    // AI MODERATION (Gemini)
+    const mod = await aiCheck(userText);
+    if (mod.category !== "safe" && mod.score > 0.7) {
+      await deleteMessage(BOT_TOKEN, chatId, msg.message_id);
+      await sendMessage(
+        BOT_TOKEN,
+        chatId,
+        `⚠️ AI detected *${mod.category}* message from ${displayName}`
+      );
+      return res.status(200).json({ ok: true });
+    }
   }
 
   // =====================================================
@@ -182,7 +245,19 @@ export default async function handler(req, res) {
 
   // COMMANDS
   if (userText.startsWith("/")) {
-    if (!allowCommand && isGroup) {
+    if (isGroup && !allowCommand) {
+      // ignore random commands in group
+      return res.status(200).json({ ok: true });
+    }
+
+    // Admin / owner check (Option C)
+    const isAdmin = await isAdminOrOwner(BOT_TOKEN, chatId, msg.from.id);
+    if (!isAdmin) {
+      await sendMessage(
+        BOT_TOKEN,
+        chatId,
+        "❌ Sirf group admin/owner ye command use kar sakte hain."
+      );
       return res.status(200).json({ ok: true });
     }
 
@@ -190,20 +265,29 @@ export default async function handler(req, res) {
 
     switch (cmd) {
       case "/ban":
-        await banCommand(msg, (t) => sendMessage(BOT_TOKEN, chatId, t), (uid) =>
-          banUser(BOT_TOKEN, chatId, uid)
+        await banCommand(
+          msg,
+          (t) => sendMessage(BOT_TOKEN, chatId, t),
+          (targetId) => banUser(BOT_TOKEN, chatId, targetId),
+          BOT_TOKEN
         );
         break;
 
       case "/kick":
-        await kickCommand(msg, (t) => sendMessage(BOT_TOKEN, chatId, t), (uid) =>
-          kickUser(BOT_TOKEN, chatId, uid)
+        await kickCommand(
+          msg,
+          (t) => sendMessage(BOT_TOKEN, chatId, t),
+          (targetId) => kickUser(BOT_TOKEN, chatId, targetId),
+          BOT_TOKEN
         );
         break;
 
       case "/mute":
-        await muteCommand(msg, (t) => sendMessage(BOT_TOKEN, chatId, t), (uid) =>
-          muteUser(BOT_TOKEN, chatId, uid)
+        await muteCommand(
+          msg,
+          (t) => sendMessage(BOT_TOKEN, chatId, t),
+          (targetId) => muteUser(BOT_TOKEN, chatId, targetId),
+          BOT_TOKEN
         );
         break;
 
@@ -252,7 +336,8 @@ export default async function handler(req, res) {
     time: new Date(),
   });
 
-  if (memory.history.length > 10) memory.history = memory.history.slice(-10);
+  if (memory.history.length > 10)
+    memory.history = memory.history.slice(-10);
 
   memory.mode = personality;
   await memory.save();
@@ -267,9 +352,12 @@ export default async function handler(req, res) {
       : "Tum 18 saal ki Delhi ki cute girl ho, soft + friendly tone me.";
 
   const toneMap = {
-    flirty: "Tum flirty, teasing, sweet tone me reply doge. 1â€“3 lines.",
-    professional: "Tum calm, polite, respectful tone me reply doge.",
-    normal: "Tum soft Hinglish me friendly, natural tone me reply doge.",
+    flirty:
+      "Tum flirty, teasing, sweet tone me reply doge. 1–3 lines.",
+    professional:
+      "Tum calm, polite, respectful tone me reply doge.",
+    normal:
+      "Tum soft Hinglish me friendly, natural tone me reply doge.",
   };
 
   const ownerRule = `
@@ -302,7 +390,7 @@ Her:
   try {
     reply = await generateWithYuki(finalPrompt);
   } catch {
-    reply = "Oops, thoda issue aa gaya ðŸ˜…";
+    reply = "Oops, thoda issue aa gaya 😅";
   }
 
   memory.history.push({
@@ -311,7 +399,8 @@ Her:
     time: new Date(),
   });
 
-  if (memory.history.length > 10) memory.history = memory.history.slice(-10);
+  if (memory.history.length > 10)
+    memory.history = memory.history.slice(-10);
 
   await memory.save();
 
